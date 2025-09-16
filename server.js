@@ -1,5 +1,5 @@
-// Twilio <-> OpenAI Realtime bridge (fixed modalities + 100ms buffer)
-// Render env var: OPENAI_API_KEY
+// Twilio <-> OpenAI Realtime bridge (guards for empty commit + response queue)
+// Env: OPENAI_API_KEY
 
 import http from "http";
 import WebSocket, { WebSocketServer } from "ws";
@@ -9,7 +9,7 @@ const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
 const MODEL = "gpt-4o-realtime-preview";
 const VOICE = "marin";
 
-// ---------- μ-law <-> PCM16 helpers (Twilio media = 8k μ-law mono) ----------
+// --------- μ-law <-> PCM16 helpers ----------
 function muLawDecode(u8) {
   const BIAS = 33;
   const out = new Int16Array(u8.length);
@@ -48,7 +48,7 @@ const downsample16kTo8k = (a16k) => {
   return out;
 };
 
-// ---------- OpenAI Realtime connect ----------
+// --------- OpenAI Realtime connect ----------
 function connectOpenAI() {
   const url = `wss://api.openai.com/v1/realtime?model=${encodeURIComponent(MODEL)}`;
   const headers = {
@@ -63,13 +63,13 @@ function connectOpenAI() {
   });
 }
 
-// ---------- HTTP server (health) ----------
+// --------- HTTP health ----------
 const server = http.createServer((_req, res) => {
   res.writeHead(200, { "Content-Type": "text/plain" });
   res.end("Twilio ↔ OpenAI Realtime voice bridge running.");
 });
 
-// ---------- WebSocket upgrade only for /twilio ----------
+// --------- Upgrade only /twilio ----------
 const wss = new WebSocketServer({ noServer: true });
 server.on("upgrade", (req, socket, head) => {
   if (req.url === "/twilio") {
@@ -79,7 +79,7 @@ server.on("upgrade", (req, socket, head) => {
   }
 });
 
-// ---------- Main bridge ----------
+// ======== Main bridge ========
 wss.on("connection", async (twilioWS) => {
   console.log("➡️  Twilio connected");
 
@@ -97,45 +97,46 @@ wss.on("connection", async (twilioWS) => {
     return;
   }
 
-  // Set voice and any session options
-  openaiWS.send(JSON.stringify({
-    type: "session.update",
-    session: { voice: VOICE }
-  }));
+  // Voice + initial greeting
+  openaiWS.send(JSON.stringify({ type: "session.update", session: { voice: VOICE } }));
+  let responseInFlight = false;        // avoid "active_response" errors
 
-  // Assistant greets first (modalities MUST include 'text' with 'audio')
-  openaiWS.send(JSON.stringify({
-    type: "response.create",
-    response: {
-      modalities: ["audio", "text"],
-      instructions:
-        "Hi, thanks for calling Patch Pros! Tell me the drywall or painting work you need and your zip code, and I’ll give you a quick ballpark."
-    }
-  }));
+  function createResponse(instructions) {
+    if (responseInFlight) return;       // don't overlap
+    responseInFlight = true;
+    openaiWS.send(JSON.stringify({
+      type: "response.create",
+      response: { modalities: ["audio","text"], instructions }
+    }));
+  }
 
-  // ------- Buffer for ≥100ms before commit -------
+  // initial greeting
+  createResponse("Hi, thanks for calling Patch Pros! Tell me the drywall or painting work you need and your zip code, and I’ll give you a quick ballpark.");
+
+  // Buffer audio ≥ 120ms before commit
   let audioChunks = [];
-  let samples16k = 0; // total samples at 16k in buffer
-  const MIN_MS = 120; // safe margin above 100ms
-  const SAMPLES_100MS = Math.ceil((MIN_MS / 1000) * 16000); // ~1920
+  let samples16k = 0;
+  const MIN_MS = 120;
+  const SAMPLES_THRESHOLD = Math.ceil((MIN_MS / 1000) * 16000); // ~1920
 
-  function flushIfReady() {
-    if (samples16k >= SAMPLES_100MS) {
-      // Concatenate Int16 chunks
+  function commitIfReady() {
+    if (samples16k >= SAMPLES_THRESHOLD) {
       const total = samples16k;
-      const out = new Int16Array(total);
+      const buf = new Int16Array(total);
       let off = 0;
-      for (const c of audioChunks) { out.set(c, off); off += c.length; }
+      for (const c of audioChunks) { buf.set(c, off); off += c.length; }
 
+      // append then commit — GUARDED
       openaiWS.send(JSON.stringify({
         type: "input_audio_buffer.append",
-        audio: Buffer.from(out.buffer).toString("base64")
+        audio: Buffer.from(buf.buffer).toString("base64")
       }));
       openaiWS.send(JSON.stringify({ type: "input_audio_buffer.commit" }));
-      openaiWS.send(JSON.stringify({
-        type: "response.create",
-        response: { modalities: ["audio", "text"] }
-      }));
+
+      // only ask for a response if we're not already speaking
+      if (!responseInFlight) {
+        createResponse(""); // no extra instructions; continue conversation
+      }
 
       // reset buffer
       audioChunks = [];
@@ -156,13 +157,13 @@ wss.on("connection", async (twilioWS) => {
         audioChunks.push(pcm16k);
         samples16k += pcm16k.length;
 
-        flushIfReady();
+        commitIfReady();
       } else if (data.event === "start") {
         console.log("🎙️  Twilio stream start");
       } else if (data.event === "stop") {
         console.log("⏹️  Twilio stream stop");
-        // Flush any remainder big enough
-        flushIfReady();
+        // one last guarded flush
+        commitIfReady();
         try { openaiWS.send(JSON.stringify({ type: "response.cancel" })); } catch {}
         try { openaiWS.close(); } catch {}
       }
@@ -180,6 +181,7 @@ wss.on("connection", async (twilioWS) => {
   openaiWS.on("message", (raw) => {
     try {
       const evt = JSON.parse(raw.toString());
+
       if (evt.type === "response.output_audio.delta" && evt.delta) {
         const pcm16k = new Int16Array(Buffer.from(evt.delta, "base64").buffer);
         const pcm8k = downsample16kTo8k(pcm16k);
@@ -188,8 +190,13 @@ wss.on("connection", async (twilioWS) => {
           event: "media",
           media: { payload: Buffer.from(mu).toString("base64") }
         }));
+      } else if (evt.type === "response.completed") {
+        // TTS turn finished — we may create a new response when audio arrives
+        responseInFlight = false;
       } else if (evt.type === "error") {
         console.error("OpenAI error event:", evt);
+        // On error, allow next response attempt
+        responseInFlight = false;
       }
     } catch (e) {
       console.error("OpenAI msg error:", e?.message || e);
@@ -203,7 +210,5 @@ wss.on("connection", async (twilioWS) => {
   openaiWS.on("close", clear);
 });
 
-// ---------- Start server ----------
-server.listen(PORT, () => {
-  console.log("Server listening on", PORT);
-});
+// --------- start ----------
+server.listen(PORT, () => console.log("Server listening on", PORT));
