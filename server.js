@@ -1,15 +1,12 @@
-// Twilio <-> OpenAI Realtime bridge (stable, voice enabled)
-// Render env var REQUIRED: OPENAI_API_KEY = sk-...
+// Twilio <-> OpenAI Realtime bridge (fixed modalities + 100ms buffer)
+// Render env var: OPENAI_API_KEY
 
 import http from "http";
 import WebSocket, { WebSocketServer } from "ws";
 
-// ---------- Config ----------
 const PORT = process.env.PORT || 8080;
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
-// Realtime-capable model:
 const MODEL = "gpt-4o-realtime-preview";
-// Voice will be set via session.update after connect:
 const VOICE = "marin";
 
 // ---------- μ-law <-> PCM16 helpers (Twilio media = 8k μ-law mono) ----------
@@ -72,7 +69,7 @@ const server = http.createServer((_req, res) => {
   res.end("Twilio ↔ OpenAI Realtime voice bridge running.");
 });
 
-// ---------- WebSocket upgrade just for /twilio ----------
+// ---------- WebSocket upgrade only for /twilio ----------
 const wss = new WebSocketServer({ noServer: true });
 server.on("upgrade", (req, socket, head) => {
   if (req.url === "/twilio") {
@@ -100,21 +97,51 @@ wss.on("connection", async (twilioWS) => {
     return;
   }
 
-  // Set voice via session.update
+  // Set voice and any session options
   openaiWS.send(JSON.stringify({
     type: "session.update",
     session: { voice: VOICE }
   }));
 
-  // Assistant greets first
+  // Assistant greets first (modalities MUST include 'text' with 'audio')
   openaiWS.send(JSON.stringify({
     type: "response.create",
     response: {
-      modalities: ["audio"],
+      modalities: ["audio", "text"],
       instructions:
         "Hi, thanks for calling Patch Pros! Tell me the drywall or painting work you need and your zip code, and I’ll give you a quick ballpark."
     }
   }));
+
+  // ------- Buffer for ≥100ms before commit -------
+  let audioChunks = [];
+  let samples16k = 0; // total samples at 16k in buffer
+  const MIN_MS = 120; // safe margin above 100ms
+  const SAMPLES_100MS = Math.ceil((MIN_MS / 1000) * 16000); // ~1920
+
+  function flushIfReady() {
+    if (samples16k >= SAMPLES_100MS) {
+      // Concatenate Int16 chunks
+      const total = samples16k;
+      const out = new Int16Array(total);
+      let off = 0;
+      for (const c of audioChunks) { out.set(c, off); off += c.length; }
+
+      openaiWS.send(JSON.stringify({
+        type: "input_audio_buffer.append",
+        audio: Buffer.from(out.buffer).toString("base64")
+      }));
+      openaiWS.send(JSON.stringify({ type: "input_audio_buffer.commit" }));
+      openaiWS.send(JSON.stringify({
+        type: "response.create",
+        response: { modalities: ["audio", "text"] }
+      }));
+
+      // reset buffer
+      audioChunks = [];
+      samples16k = 0;
+    }
+  }
 
   // Twilio -> OpenAI
   twilioWS.on("message", (msg) => {
@@ -126,16 +153,16 @@ wss.on("connection", async (twilioWS) => {
         const pcm8k = muLawDecode(new Uint8Array(mu));
         const pcm16k = upsample8kTo16k(pcm8k);
 
-        openaiWS.send(JSON.stringify({
-          type: "input_audio_buffer.append",
-          audio: Buffer.from(pcm16k.buffer).toString("base64")
-        }));
-        openaiWS.send(JSON.stringify({ type: "input_audio_buffer.commit" }));
-        openaiWS.send(JSON.stringify({ type: "response.create", response: { modalities: ["audio"] } }));
+        audioChunks.push(pcm16k);
+        samples16k += pcm16k.length;
+
+        flushIfReady();
       } else if (data.event === "start") {
         console.log("🎙️  Twilio stream start");
       } else if (data.event === "stop") {
         console.log("⏹️  Twilio stream stop");
+        // Flush any remainder big enough
+        flushIfReady();
         try { openaiWS.send(JSON.stringify({ type: "response.cancel" })); } catch {}
         try { openaiWS.close(); } catch {}
       }
@@ -169,11 +196,8 @@ wss.on("connection", async (twilioWS) => {
     }
   });
 
-  // Keep-alive pings (optional)
-  const ping = setInterval(() => {
-    try { twilioWS.ping(); } catch {}
-    try { openaiWS.ping(); } catch {}
-  }, 25000);
+  // Keep-alives
+  const ping = setInterval(() => { try { twilioWS.ping(); } catch {}; try { openaiWS.ping(); } catch {}; }, 25000);
   const clear = () => { try { clearInterval(ping); } catch {}; };
   twilioWS.on("close", clear);
   openaiWS.on("close", clear);
