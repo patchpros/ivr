@@ -1,6 +1,5 @@
-// Twilio <-> OpenAI Realtime bridge (guards for empty commit + response queue)
-// Env: OPENAI_API_KEY
-
+// Twilio <-> OpenAI Realtime bridge
+// Env var: OPENAI_API_KEY
 import http from "http";
 import WebSocket, { WebSocketServer } from "ws";
 
@@ -9,7 +8,7 @@ const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
 const MODEL = "gpt-4o-realtime-preview";
 const VOICE = "marin";
 
-// --------- μ-law <-> PCM16 helpers ----------
+// ---------- μ-law <-> PCM16 ----------
 function muLawDecode(u8) {
   const BIAS = 33;
   const out = new Int16Array(u8.length);
@@ -48,7 +47,7 @@ const downsample16kTo8k = (a16k) => {
   return out;
 };
 
-// --------- OpenAI Realtime connect ----------
+// ---------- OpenAI WS ----------
 function connectOpenAI() {
   const url = `wss://api.openai.com/v1/realtime?model=${encodeURIComponent(MODEL)}`;
   const headers = {
@@ -63,46 +62,42 @@ function connectOpenAI() {
   });
 }
 
-// --------- HTTP health ----------
+// ---------- HTTP health ----------
 const server = http.createServer((_req, res) => {
   res.writeHead(200, { "Content-Type": "text/plain" });
   res.end("Twilio ↔ OpenAI Realtime voice bridge running.");
 });
 
-// --------- Upgrade only /twilio ----------
+// ---------- Upgrade only /twilio ----------
 const wss = new WebSocketServer({ noServer: true });
 server.on("upgrade", (req, socket, head) => {
   if (req.url === "/twilio") {
     wss.handleUpgrade(req, socket, head, (ws) => wss.emit("connection", ws, req));
-  } else {
-    socket.destroy();
-  }
+  } else socket.destroy();
 });
 
-// ======== Main bridge ========
+// ================== Main bridge ==================
 wss.on("connection", async (twilioWS) => {
   console.log("➡️  Twilio connected");
-
-  if (!OPENAI_API_KEY) {
-    console.error("❌ Missing OPENAI_API_KEY");
-    twilioWS.close();
-    return;
-  }
+  if (!OPENAI_API_KEY) { console.error("❌ Missing OPENAI_API_KEY"); twilioWS.close(); return; }
 
   let openaiWS;
-  try {
-    openaiWS = await connectOpenAI();
-  } catch {
-    twilioWS.close();
-    return;
-  }
+  try { openaiWS = await connectOpenAI(); }
+  catch { twilioWS.close(); return; }
 
-  // Voice + initial greeting
+  // Pick voice
   openaiWS.send(JSON.stringify({ type: "session.update", session: { voice: VOICE } }));
-  let responseInFlight = false;        // avoid "active_response" errors
 
-  function createResponse(instructions) {
-    if (responseInFlight) return;       // don't overlap
+  // State
+  let responseInFlight = false;               // true while TTS is speaking
+  let audioChunks = [];                       // Int16Array[] @ 16k
+  let samples16k = 0;
+  const MIN_MS = 120;
+  const THRESH = Math.ceil((MIN_MS / 1000) * 16000);  // ~1920 samples
+
+  // Helper: request a new spoken response only if idle
+  function askToSpeak(instructions = "") {
+    if (responseInFlight) return;
     responseInFlight = true;
     openaiWS.send(JSON.stringify({
       type: "response.create",
@@ -110,60 +105,49 @@ wss.on("connection", async (twilioWS) => {
     }));
   }
 
-  // initial greeting
-  createResponse("Hi, thanks for calling Patch Pros! Tell me the drywall or painting work you need and your zip code, and I’ll give you a quick ballpark.");
+  // Greet once
+  askToSpeak("Hi, thanks for calling Patch Pros! Tell me the drywall or painting work you need and your zip code, and I’ll give you a quick ballpark.");
 
-  // Buffer audio ≥ 120ms before commit
-  let audioChunks = [];
-  let samples16k = 0;
-  const MIN_MS = 120;
-  const SAMPLES_THRESHOLD = Math.ceil((MIN_MS / 1000) * 16000); // ~1920
-
-  function commitIfReady() {
-    if (samples16k >= SAMPLES_THRESHOLD) {
-      const total = samples16k;
-      const buf = new Int16Array(total);
-      let off = 0;
-      for (const c of audioChunks) { buf.set(c, off); off += c.length; }
-
-      // append then commit — GUARDED
-      openaiWS.send(JSON.stringify({
-        type: "input_audio_buffer.append",
-        audio: Buffer.from(buf.buffer).toString("base64")
-      }));
-      openaiWS.send(JSON.stringify({ type: "input_audio_buffer.commit" }));
-
-      // only ask for a response if we're not already speaking
-      if (!responseInFlight) {
-        createResponse(""); // no extra instructions; continue conversation
-      }
-
-      // reset buffer
-      audioChunks = [];
-      samples16k = 0;
-    }
-  }
-
-  // Twilio -> OpenAI
+  // Twilio -> buffer -> when enough & idle -> append+commit+askToSpeak()
   twilioWS.on("message", (msg) => {
     try {
       const data = JSON.parse(msg.toString());
-
       if (data.event === "media") {
-        const mu = Buffer.from(data.media.payload, "base64");
+        const b64 = data.media?.payload;
+        if (!b64) return;
+        const mu = Buffer.from(b64, "base64");
+        if (!mu.length) return;
+
         const pcm8k = muLawDecode(new Uint8Array(mu));
         const pcm16k = upsample8kTo16k(pcm8k);
+        if (!pcm16k.length) return;
 
         audioChunks.push(pcm16k);
         samples16k += pcm16k.length;
 
-        commitIfReady();
+        // Only when we have ≥120ms AND model is idle:
+        if (samples16k >= THRESH && !responseInFlight) {
+          const out = new Int16Array(samples16k);
+          let off = 0;
+          for (const c of audioChunks) { out.set(c, off); off += c.length; }
+
+          openaiWS.send(JSON.stringify({
+            type: "input_audio_buffer.append",
+            audio: Buffer.from(out.buffer).toString("base64")
+          }));
+          openaiWS.send(JSON.stringify({ type: "input_audio_buffer.commit" }));
+
+          // request the model to speak back for this user chunk
+          askToSpeak();
+
+          // reset buffer
+          audioChunks = [];
+          samples16k = 0;
+        }
       } else if (data.event === "start") {
         console.log("🎙️  Twilio stream start");
       } else if (data.event === "stop") {
         console.log("⏹️  Twilio stream stop");
-        // one last guarded flush
-        commitIfReady();
         try { openaiWS.send(JSON.stringify({ type: "response.cancel" })); } catch {}
         try { openaiWS.close(); } catch {}
       }
@@ -184,18 +168,16 @@ wss.on("connection", async (twilioWS) => {
 
       if (evt.type === "response.output_audio.delta" && evt.delta) {
         const pcm16k = new Int16Array(Buffer.from(evt.delta, "base64").buffer);
+        if (!pcm16k.length) return;
         const pcm8k = downsample16kTo8k(pcm16k);
         const mu = muLawEncode(pcm8k);
-        twilioWS.send(JSON.stringify({
-          event: "media",
-          media: { payload: Buffer.from(mu).toString("base64") }
-        }));
+        twilioWS.send(JSON.stringify({ event: "media", media: { payload: Buffer.from(mu).toString("base64") } }));
       } else if (evt.type === "response.completed") {
-        // TTS turn finished — we may create a new response when audio arrives
+        // model finished speaking; allow next turn
         responseInFlight = false;
       } else if (evt.type === "error") {
         console.error("OpenAI error event:", evt);
-        // On error, allow next response attempt
+        // release the lock so we can recover
         responseInFlight = false;
       }
     } catch (e) {
@@ -203,12 +185,12 @@ wss.on("connection", async (twilioWS) => {
     }
   });
 
-  // Keep-alives
+  // keep-alive
   const ping = setInterval(() => { try { twilioWS.ping(); } catch {}; try { openaiWS.ping(); } catch {}; }, 25000);
   const clear = () => { try { clearInterval(ping); } catch {}; };
   twilioWS.on("close", clear);
   openaiWS.on("close", clear);
 });
 
-// --------- start ----------
+// start
 server.listen(PORT, () => console.log("Server listening on", PORT));
