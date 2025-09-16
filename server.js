@@ -74,7 +74,18 @@ const server = http.createServer((_req, res) => {
   res.end("Twilio ↔ OpenAI Realtime voice bridge running.");
 });
 
-const wss = new WebSocketServer({ server, path: "/twilio" });
+const wss = new WebSocketServer({ noServer: true });
+
+server.on("upgrade", (req, socket, head) => {
+  if (req.url === "/twilio") {
+    wss.handleUpgrade(req, socket, head, (ws) => {
+      wss.emit("connection", ws, req);
+    });
+  } else {
+    socket.destroy();
+  }
+});
+
 
 wss.on("connection", async (twilioWS) => {
   console.log("Twilio connected");
@@ -152,3 +163,4 @@ wss.on("connection", async (twilioWS) => {
 server.listen(PORT, () => {
   console.log("Server listening on", PORT);
 });
+
