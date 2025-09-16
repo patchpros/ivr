@@ -1,5 +1,5 @@
 // Twilio <-> OpenAI Realtime voice bridge
-// Render env var required: OPENAI_API_KEY
+// Env var on Render: OPENAI_API_KEY
 
 import http from "http";
 import WebSocket, { WebSocketServer } from "ws";
@@ -86,8 +86,19 @@ wss.on("connection", async (twilioWS) => {
   try { openaiWS = await connectOpenAI(); }
   catch { twilioWS.close(); return; }
 
-  // Set the TTS voice
-  openaiWS.send(JSON.stringify({ type: "session.update", session: { voice: VOICE } }));
+  // Tell OpenAI exactly what audio formats we use
+  openaiWS.send(JSON.stringify({
+    type: "session.update",
+    session: {
+      voice: VOICE,
+      // what we send in (after decoding/upsampling)
+      input_audio_format: { type: "pcm16", sample_rate_hz: 16000 },
+      // what we want back
+      output_audio_format: { type: "pcm16", sample_rate_hz: 16000 },
+      // keep VAD out of the way; we control turns
+      turn_detection: { type: "none" }
+    }
+  }));
 
   let responseInFlight = false;          // true while model is speaking
   let sawAnyAudioDelta = false;
@@ -103,7 +114,7 @@ wss.on("connection", async (twilioWS) => {
       response: {
         modalities: ["audio", "text"],
         instructions,
-        conversation: "auto"             // ✅ valid values: 'auto' | 'none'
+        conversation: "auto"             // valid: 'auto' | 'none'
       }
     }));
 
@@ -153,7 +164,6 @@ wss.on("connection", async (twilioWS) => {
           let off = 0;
           for (const c of audioChunks) { out.set(c, off); off += c.length; }
 
-          // Guard: do not send empty append/commit
           if (out.length > 0) {
             openaiWS.send(JSON.stringify({
               type: "input_audio_buffer.append",
@@ -163,7 +173,6 @@ wss.on("connection", async (twilioWS) => {
             console.log(`↘️  committed ${samples16k} samples (~${Math.round(samples16k/160)}ms)`);
           }
 
-          // reset buffer and ask for a reply
           audioChunks = [];
           samples16k = 0;
           askToSpeak("");
@@ -188,10 +197,16 @@ wss.on("connection", async (twilioWS) => {
     clearTimeout(safetyRepromptTimer);
   });
 
-  // OpenAI -> Twilio
+  // OpenAI -> Twilio (log *all* event types so we see what's happening)
   openaiWS.on("message", (raw) => {
     try {
       const evt = JSON.parse(raw.toString());
+      if (evt?.type) {
+        if (evt.type !== "response.output_audio.delta" &&
+            evt.type !== "response.audio.delta") {
+          console.log("OpenAI evt:", evt.type);
+        }
+      }
 
       // Accept both delta event names
       if ((evt.type === "response.output_audio.delta" || evt.type === "response.audio.delta") && evt.delta) {
