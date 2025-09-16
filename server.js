@@ -1,5 +1,5 @@
-// Minimal Twilio <-> OpenAI Realtime bridge (stable)
-// Requirements (Render env var): OPENAI_API_KEY = sk-...
+// Twilio <-> OpenAI Realtime bridge (stable, voice enabled)
+// Render env var REQUIRED: OPENAI_API_KEY = sk-...
 
 import http from "http";
 import WebSocket, { WebSocketServer } from "ws";
@@ -7,7 +7,10 @@ import WebSocket, { WebSocketServer } from "ws";
 // ---------- Config ----------
 const PORT = process.env.PORT || 8080;
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
-const MODEL = "gpt-4o-mini-tts"; // realtime voice-capable model
+// Realtime-capable model:
+const MODEL = "gpt-4o-realtime-preview";
+// Voice will be set via session.update after connect:
+const VOICE = "marin";
 
 // ---------- μ-law <-> PCM16 helpers (Twilio media = 8k μ-law mono) ----------
 function muLawDecode(u8) {
@@ -48,7 +51,7 @@ const downsample16kTo8k = (a16k) => {
   return out;
 };
 
-// ---------- OpenAI Realtime connect (no voice/prompt params) ----------
+// ---------- OpenAI Realtime connect ----------
 function connectOpenAI() {
   const url = `wss://api.openai.com/v1/realtime?model=${encodeURIComponent(MODEL)}`;
   const headers = {
@@ -58,18 +61,18 @@ function connectOpenAI() {
   const ws = new WebSocket(url, { headers });
   return new Promise((resolve, reject) => {
     ws.on("open", () => { console.log("✅ OpenAI connected"); resolve(ws); });
-    ws.on("error", (e) => { console.error("❌ OpenAI WS error:", e.message || e); reject(e); });
+    ws.on("error", (e) => { console.error("❌ OpenAI WS error:", e?.message || e); reject(e); });
     ws.on("close", () => { console.log("❌ OpenAI closed"); });
   });
 }
 
-// ---------- HTTP server (for health) ----------
+// ---------- HTTP server (health) ----------
 const server = http.createServer((_req, res) => {
   res.writeHead(200, { "Content-Type": "text/plain" });
   res.end("Twilio ↔ OpenAI Realtime voice bridge running.");
 });
 
-// ---------- WebSocket upgrade for /twilio ----------
+// ---------- WebSocket upgrade just for /twilio ----------
 const wss = new WebSocketServer({ noServer: true });
 server.on("upgrade", (req, socket, head) => {
   if (req.url === "/twilio") {
@@ -97,12 +100,19 @@ wss.on("connection", async (twilioWS) => {
     return;
   }
 
-  // Make the assistant speak first with a simple inline greeting
+  // Set voice via session.update
+  openaiWS.send(JSON.stringify({
+    type: "session.update",
+    session: { voice: VOICE }
+  }));
+
+  // Assistant greets first
   openaiWS.send(JSON.stringify({
     type: "response.create",
     response: {
       modalities: ["audio"],
-      instructions: "Hi, thanks for calling Patch Pros! Tell me the drywall or painting work you need and your zip code, and I’ll give you a quick ballpark."
+      instructions:
+        "Hi, thanks for calling Patch Pros! Tell me the drywall or painting work you need and your zip code, and I’ll give you a quick ballpark."
     }
   }));
 
@@ -130,7 +140,7 @@ wss.on("connection", async (twilioWS) => {
         try { openaiWS.close(); } catch {}
       }
     } catch (e) {
-      console.error("Twilio msg error:", e.message || e);
+      console.error("Twilio msg error:", e?.message || e);
     }
   });
 
@@ -143,7 +153,6 @@ wss.on("connection", async (twilioWS) => {
   openaiWS.on("message", (raw) => {
     try {
       const evt = JSON.parse(raw.toString());
-
       if (evt.type === "response.output_audio.delta" && evt.delta) {
         const pcm16k = new Int16Array(Buffer.from(evt.delta, "base64").buffer);
         const pcm8k = downsample16kTo8k(pcm16k);
@@ -156,7 +165,7 @@ wss.on("connection", async (twilioWS) => {
         console.error("OpenAI error event:", evt);
       }
     } catch (e) {
-      console.error("OpenAI msg error:", e.message || e);
+      console.error("OpenAI msg error:", e?.message || e);
     }
   });
 
@@ -165,7 +174,6 @@ wss.on("connection", async (twilioWS) => {
     try { twilioWS.ping(); } catch {}
     try { openaiWS.ping(); } catch {}
   }, 25000);
-
   const clear = () => { try { clearInterval(ping); } catch {}; };
   twilioWS.on("close", clear);
   openaiWS.on("close", clear);
@@ -175,4 +183,3 @@ wss.on("connection", async (twilioWS) => {
 server.listen(PORT, () => {
   console.log("Server listening on", PORT);
 });
-
