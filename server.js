@@ -1,3 +1,9 @@
+const MODEL = "gpt-4o-mini-tts";   // realtime TTS-capable
+const VOICE = "Marin";             // match your playground voice
+
+const USE_PROMPT_ID = true;        // <- turn ON
+const PROMPT_ID = "pmpt_68c995a081d48197b3a2f234ed3320b10a877ec0b3af0900";
+
 import http from "http";
 import crypto from "crypto";
 import WebSocket, { WebSocketServer } from "ws";
@@ -171,3 +177,4 @@ wss.on("connection", async (twilioWS, req) => {
 server.listen(PORT, () => {
   console.log("Server listening on", PORT);
 });
+
