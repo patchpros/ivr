@@ -1,112 +1,103 @@
 import express from "express";
 import expressWs from "express-ws";
 import WebSocket from "ws";
-import alawmulaw from "alawmulaw";
+import fetch from "node-fetch";
+import alawmulaw from "alawmulaw";   // 👈 μ-law <-> PCM16
 
-const { decode, encode } = alawmulaw.ulaw;
+// Decode/Encode functions
+const decode = alawmulaw.decode;     // Twilio μ-law → PCM16
+const encode = alawmulaw.encode;     // PCM16 → Twilio μ-law
 
+// ====== CONFIG ======
+const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
+const MODEL = "gpt-4o-realtime-preview-2024-12";   // Realtime model
+const VOICE = "marin";                             // Voice option
+const PORT = process.env.PORT || 10000;
+
+// ====== EXPRESS + WS SERVER ======
 const app = express();
 expressWs(app);
 
-const PORT = process.env.PORT || 10000;
+app.get("/", (_req, res) => {
+  res.send("Twilio ↔ OpenAI Realtime voice bridge running.");
+});
 
-// WebSocket endpoint Twilio connects to
-app.ws("/twilio", async (ws, req) => {
-  console.log("🔔 Twilio connected");
+// Twilio websocket endpoint
+app.ws("/twilio", async (twilioWS, _req) => {
+  console.log("🔗 Twilio connected");
 
   // Connect to OpenAI Realtime API
-  let openAiSocket;
-  try {
-    openAiSocket = new WebSocket(
-      "wss://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview-2024-12-17",
-      {
-        headers: {
-          Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
-          "OpenAI-Beta": "realtime=v1",
-        },
-      }
-    );
-  } catch (err) {
-    console.error("❌ Failed to connect to OpenAI:", err);
-    ws.close();
-    return;
-  }
+  const openaiUrl = `wss://api.openai.com/v1/realtime?model=${MODEL}&voice=${VOICE}`;
+  const openaiWS = new WebSocket(openaiUrl, {
+    headers: {
+      Authorization: `Bearer ${OPENAI_API_KEY}`,
+      "OpenAI-Beta": "realtime=v1",
+    },
+  });
 
-  // When OpenAI socket opens
-  openAiSocket.on("open", () => {
+  // When OpenAI connection is open
+  openaiWS.on("open", () => {
     console.log("✅ OpenAI connected");
   });
 
-  // Messages from OpenAI
-  openAiSocket.on("message", (raw) => {
-    const data = JSON.parse(raw.toString());
-
-    if (data.type === "response.output_audio.delta") {
-      // OpenAI sends PCM16 → encode to μ-law for Twilio
-      const pcm16 = Buffer.from(data.delta, "base64");
-      const ulawEncoded = encode(pcm16);
-      const b64u = Buffer.from(ulawEncoded).toString("base64");
-
-      ws.send(
-        JSON.stringify({
-          event: "media",
-          media: { payload: b64u },
-        })
-      );
+  // Forward Twilio audio → OpenAI
+  twilioWS.on("message", (msg) => {
+    try {
+      const data = JSON.parse(msg.toString());
+      if (data.event === "media") {
+        const ulaw = Buffer.from(data.media.payload, "base64");
+        const pcm16 = decode(ulaw); // μ-law → PCM16
+        openaiWS.send(
+          JSON.stringify({
+            type: "input_audio_buffer.append",
+            audio: Buffer.from(pcm16.buffer).toString("base64"),
+          })
+        );
+        openaiWS.send(JSON.stringify({ type: "input_audio_buffer.commit" }));
+        openaiWS.send(
+          JSON.stringify({ type: "response.create", response: { modalities: ["audio"] } })
+        );
+      }
+    } catch (err) {
+      console.error("❌ Twilio msg error:", err);
     }
   });
 
-  openAiSocket.on("close", () => {
-    console.log("❌ OpenAI closed");
-    ws.close();
-  });
-
-  openAiSocket.on("error", (err) => {
-    console.error("❌ OpenAI error:", err);
-    ws.close();
-  });
-
-  // Messages from Twilio
-  ws.on("message", (msg) => {
-    const data = JSON.parse(msg.toString());
-
-    if (data.event === "media") {
-      // Twilio sends μ-law → decode to PCM16 → forward to OpenAI
-      const ulawBytes = Buffer.from(data.media.payload, "base64");
-      const pcm16 = decode(ulawBytes);
-
-      if (openAiSocket && openAiSocket.readyState === WebSocket.OPEN) {
-        openAiSocket.send(
+  // Forward OpenAI audio → Twilio
+  openaiWS.on("message", (raw) => {
+    try {
+      const evt = JSON.parse(raw.toString());
+      if (evt.type === "response.output_audio.delta" && evt.delta) {
+        const pcm16 = new Int16Array(Buffer.from(evt.delta, "base64").buffer);
+        const ulaw = encode(pcm16); // PCM16 → μ-law
+        twilioWS.send(
           JSON.stringify({
-            type: "input_audio_buffer.append",
-            audio: Buffer.from(pcm16).toString("base64"),
+            event: "media",
+            media: { payload: Buffer.from(ulaw).toString("base64") },
           })
         );
       }
-    } else if (data.event === "start") {
-      console.log("▶️ Call started");
-    } else if (data.event === "stop") {
-      console.log("⏹️ Call ended");
-      if (openAiSocket && openAiSocket.readyState === WebSocket.OPEN) {
-        openAiSocket.close();
-      }
+    } catch (err) {
+      console.error("❌ OpenAI msg error:", err);
     }
   });
 
-  ws.on("close", () => {
-    console.log("❌ Twilio closed");
-    if (openAiSocket && openAiSocket.readyState === WebSocket.OPEN) {
-      openAiSocket.close();
-    }
+  // Handle closes
+  twilioWS.on("close", () => {
+    console.log("🔴 Twilio closed");
+    try {
+      openaiWS.close();
+    } catch {}
+  });
+
+  openaiWS.on("close", () => {
+    console.log("🔴 OpenAI closed");
+    try {
+      twilioWS.close();
+    } catch {}
   });
 });
 
-// Root
-app.get("/", (req, res) => {
-  res.send("Twilio ↔ OpenAI IVR running");
-});
-
-// Start server
 app.listen(PORT, () => {
   console.log(`🚀 Server listening on ${PORT}`);
 });
