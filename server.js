@@ -2,7 +2,9 @@ import express from "express";
 import expressWs from "express-ws";
 import WebSocket from "ws";
 import fetch from "node-fetch";
-import { decode, encode } from "alawmulaw";   // 👈 handles μ-law audio
+import alawmulaw from "alawmulaw";
+const { decode, encode } = alawmulaw;
+
 import dotenv from "dotenv";
 
 dotenv.config();
@@ -122,3 +124,4 @@ app.ws("/twilio", async (twilioWS, _req) => {
 app.listen(PORT, () => {
   console.log(`🚀 Server listening on port ${PORT}`);
 });
+
