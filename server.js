@@ -1,162 +1,164 @@
-// server.js
+// Twilio <-> OpenAI Realtime voice bridge (μ-law passthrough)
+// Env vars on Render: OPENAI_API_KEY
+// Number points to Twilio Function that <Stream>s to wss://YOUR-RENDER.onrender.com/twilio
 
 import express from "express";
 import expressWs from "express-ws";
 import WebSocket from "ws";
 
-// ====== CONFIG ======
-const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
-const MODEL = "gpt-4o-realtime-preview-2024-12"; // realtime-capable
-const VOICE = "marin"; // pick a voice
 const PORT = process.env.PORT || 10000;
+const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
+
+const MODEL = "gpt-4o-realtime-preview"; // realtime-capable model
+const VOICE = "marin";                    // OpenAI voice
+
+if (!OPENAI_API_KEY) {
+  console.error("Missing OPENAI_API_KEY");
+  process.exit(1);
+}
 
 const app = express();
 expressWs(app);
 
-// --- μ-law <-> PCM16 helpers (Twilio = 8k µ-law mono) ---
-function muLawDecode(mu) {
-  const MULAW_BIAS = 33;
-  const out = new Int16Array(mu.length);
-  for (let i = 0; i < mu.length; i++) {
-    let u = ~mu[i];
-    let sign = (u & 0x80) ? -1 : 1;
-    let e = (u >> 4) & 0x07;
-    let q = u & 0x0F;
-    let t = ((q << 3) + MULAW_BIAS) << (e + 3);
-    out[i] = sign * (t - MULAW_BIAS);
-  }
-  return out;
-}
-function muLawEncode(pcm16) {
-  const out = new Uint8Array(pcm16.length);
-  for (let i = 0; i < pcm16.length; i++) {
-    let s = pcm16[i];
-    let sign = (s < 0) ? 0x80 : 0x00;
-    if (s < 0) s = -s;
-    if (s > 32635) s = 32635;
-    s += 132;
-    let e = 7;
-    for (let expMask = 0x4000; (s & expMask) === 0 && e > 0; e--, expMask >>= 1) {}
-    let q = (s >> (e + 3)) & 0x0F;
-    let u = ~(sign | (e << 4) | q) & 0xFF;
-    out[i] = u;
-  }
-  return out;
-}
-function upsample8kTo16k(int16_8k) {
-  const out = new Int16Array(int16_8k.length * 2);
-  for (let i = 0; i < int16_8k.length; i++) {
-    out[2 * i] = int16_8k[i];
-    out[2 * i + 1] = int16_8k[i];
-  }
-  return out;
-}
-function downsample16kTo8k(int16_16k) {
-  const out = new Int16Array(Math.floor(int16_16k.length / 2));
-  for (let i = 0; i < out.length; i++) out[i] = int16_16k[2 * i];
-  return out;
-}
+// Health
+app.get("/", (_req, res) => res.send("✅ Twilio ↔ OpenAI realtime server running"));
 
-// ====== Twilio → OpenAI bridge ======
+// WebSocket endpoint Twilio connects to via <Stream>
 app.ws("/twilio", async (twilioWS) => {
   console.log("📞 Twilio connected");
 
-  // Connect to OpenAI Realtime
-  const oaUrl = `wss://api.openai.com/v1/realtime?model=${MODEL}`;
-  const oa = new WebSocket(oaUrl, {
-    headers: {
-      Authorization: `Bearer ${OPENAI_API_KEY}`,
-      "OpenAI-Beta": "realtime=v1",
-    },
-  });
+  // Connect to OpenAI Realtime WS
+  const oaWS = new WebSocket(
+    `wss://api.openai.com/v1/realtime?model=${encodeURIComponent(MODEL)}`,
+    {
+      headers: {
+        Authorization: `Bearer ${OPENAI_API_KEY}`,
+        "OpenAI-Beta": "realtime=v1",
+      }
+    }
+  );
 
-  // Track if OpenAI is ready
   let oaReady = false;
-  oa.on("open", () => {
-    oaReady = true;
-    console.log("🤖 OpenAI connected");
+  let streamSid = null;
+  const pending = []; // queue Twilio audio frames until OpenAI is ready
 
-    // Configure session
-    oa.send(JSON.stringify({
+  oaWS.on("open", () => {
+    console.log("🤖 OpenAI connected");
+    oaReady = true;
+
+    // Configure session: EXACT strings for formats; let server VAD manage turns.
+    oaWS.send(JSON.stringify({
       type: "session.update",
       session: {
-        input_audio_format: "pcm16",
-        output_audio_format: "g711_ulaw", // Twilio format
         voice: VOICE,
+        input_audio_format:  "g711_ulaw", // Twilio Media Streams codec
+        output_audio_format: "g711_ulaw", // so we can pass deltas straight back
         turn_detection: { type: "server_vad" }
       }
     }));
 
-    // Greeting response
-    oa.send(JSON.stringify({
+    // Speak first (greeting)
+    oaWS.send(JSON.stringify({
       type: "response.create",
-      response: { instructions: "Hello! How can I help you today?" }
+      response: {
+        modalities: ["audio", "text"],
+        conversation: "auto",
+        instructions:
+          "Hi, thanks for calling Patch Pros! Tell me the drywall or painting work you need and your zip code, and I’ll give you a quick ballpark."
+      }
     }));
+
+    // Flush any buffered Twilio audio
+    while (pending.length) oaWS.send(pending.shift());
   });
 
-  // --- Twilio → OpenAI ---
-  twilioWS.on("message", (msg) => {
-    if (!oaReady) return;
+  oaWS.on("message", (raw) => {
     try {
-      const data = JSON.parse(msg.toString());
-      if (data.event === "media") {
-        const mu = Buffer.from(data.media.payload, "base64");
-        const pcm16_8k = muLawDecode(new Uint8Array(mu));
-        const pcm16_16k = upsample8kTo16k(pcm16_8k);
+      const evt = JSON.parse(raw.toString());
 
-        oa.send(JSON.stringify({
-          type: "input_audio_buffer.append",
-          audio: Buffer.from(pcm16_16k.buffer).toString("base64"),
-        }));
-      } else if (data.event === "mark") {
-        oa.send(JSON.stringify({ type: "input_audio_buffer.commit" }));
-        oa.send(JSON.stringify({ type: "response.create" }));
+      // Forward audio back to Twilio (either event name variant)
+      if ((evt.type === "response.output_audio.delta" || evt.type === "response.audio.delta") && evt.delta) {
+        if (twilioWS.readyState === WebSocket.OPEN && streamSid) {
+          twilioWS.send(JSON.stringify({
+            event: "media",
+            streamSid, // REQUIRED by Twilio when sending back
+            media: { payload: evt.delta } // already base64 G.711 μ-law @ 8k
+          }));
+        }
+        return;
+      }
+
+      if (evt.type === "response.completed") {
+        // Finished a TTS turn
+        return;
+      }
+
+      if (evt.type === "response.audio_transcript.delta") {
+        // Live transcript (debug)
+        process.stdout.write(evt.delta);
+        return;
+      }
+
+      if (evt.type === "error" || evt.type === "response.error") {
+        console.error("OpenAI error:", evt);
       }
     } catch (e) {
-      console.error("Twilio msg error:", e);
+      console.error("OpenAI msg parse error:", e);
+    }
+  });
+
+  oaWS.on("close", () => {
+    console.log("🤖 OpenAI closed");
+    try { twilioWS.close(); } catch {}
+  });
+
+  // Twilio -> OpenAI
+  twilioWS.on("message", (msg) => {
+    try {
+      const data = JSON.parse(msg.toString());
+
+      if (data.event === "start") {
+        streamSid = data.start?.streamSid || null;
+        console.log("▶️ Twilio stream started:", streamSid || "(no sid)");
+        return;
+      }
+
+      if (data.event === "media") {
+        // media.payload is base64 μ-law @ 8k; pass through to OpenAI
+        const payload = JSON.stringify({
+          type: "input_audio_buffer.append",
+          audio: data.media.payload
+        });
+        if (oaReady) oaWS.send(payload); else pending.push(payload);
+        return;
+      }
+
+      if (data.event === "stop") {
+        console.log("⏹️ Twilio stream stop");
+        try { oaWS.close(); } catch {}
+        return;
+      }
+
+      // Other events: mark, dtmf, etc. (ignored)
+    } catch (e) {
+      console.error("Twilio msg parse error:", e);
     }
   });
 
   twilioWS.on("close", () => {
-    console.log("📞 Twilio closed");
-    try { oa.close(); } catch {}
+    console.log("📴 Twilio closed");
+    try { oaWS.close(); } catch {}
   });
 
-  // --- OpenAI → Twilio ---
-  oa.on("message", (raw) => {
-    try {
-      const evt = JSON.parse(raw.toString());
-
-      if (evt.type === "response.output_audio.delta" && evt.delta) {
-        const pcm16 = new Int16Array(Buffer.from(evt.delta, "base64").buffer);
-        const pcm8k = downsample16kTo8k(pcm16);
-        const mu = muLawEncode(pcm8k);
-
-        twilioWS.send(JSON.stringify({
-          event: "media",
-          media: { payload: Buffer.from(mu).toString("base64") }
-        }));
-      }
-
-      if (evt.type === "response.audio_transcript.delta") {
-        console.log("📝 Transcript:", evt.delta);
-      }
-    } catch (e) {
-      console.error("OpenAI msg error:", e);
-    }
-  });
-
-  oa.on("close", () => {
-    console.log("🤖 OpenAI closed");
-    try { twilioWS.close(); } catch {}
-  });
+  // Keep-alives to avoid idle timeouts
+  const ping = setInterval(() => {
+    try { if (twilioWS.readyState === WebSocket.OPEN) twilioWS.ping(); } catch {}
+    try { if (oaWS.readyState === WebSocket.OPEN) oaWS.ping(); } catch {}
+  }, 25000);
+  const clear = () => { try { clearInterval(ping); } catch {} };
+  twilioWS.on("close", clear);
+  oaWS.on("close", clear);
 });
 
-// ====== Health check ======
-app.get("/", (req, res) => {
-  res.send("Twilio ↔ OpenAI voice bridge is live.");
-});
-
-app.listen(PORT, () => {
-  console.log(`🚀 Server listening on ${PORT}`);
-});
+// Start
+app.listen(PORT, () => console.log(`🚀 Server listening on ${PORT}`));
