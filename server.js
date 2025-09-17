@@ -1,27 +1,27 @@
 import express from "express";
 import expressWs from "express-ws";
 import WebSocket from "ws";
-import OpenAI from "openai";
 
 const app = express();
-expressWs(app); // enable WebSocket on Express
+expressWs(app);
 
 const PORT = process.env.PORT || 10000;
-const openai = new OpenAI({
-  apiKey: process.env.OPENAI_API_KEY
-});
 
 // health check
 app.get("/", (req, res) => {
   res.send("✅ Twilio <-> OpenAI realtime server running");
 });
 
-// WebSocket endpoint Twilio will connect to
+// Twilio WebSocket endpoint
 app.ws("/twilio", async (ws, req) => {
-  console.log("Twilio connected");
+  console.log("📞 Twilio connected");
 
-  // connect to OpenAI realtime API
-  const oa = new WebSocket(
+  let oa; // OpenAI socket
+  let oaReady = false;
+  const pendingMessages = []; // buffer until OpenAI is ready
+
+  // connect to OpenAI realtime
+  oa = new WebSocket(
     "wss://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview-2024-12",
     {
       headers: {
@@ -33,7 +33,9 @@ app.ws("/twilio", async (ws, req) => {
 
   oa.on("open", () => {
     console.log("✅ OpenAI connected");
-    // optional: configure session
+    oaReady = true;
+
+    // configure session
     oa.send(
       JSON.stringify({
         type: "session.update",
@@ -45,13 +47,17 @@ app.ws("/twilio", async (ws, req) => {
         }
       })
     );
+
+    // flush queued messages
+    while (pendingMessages.length > 0) {
+      oa.send(pendingMessages.shift());
+    }
   });
 
   oa.on("message", (msg) => {
     const data = JSON.parse(msg.toString());
 
     if (data.type === "response.audio.delta") {
-      // stream audio chunks back to Twilio
       ws.send(
         JSON.stringify({
           event: "media",
@@ -78,28 +84,31 @@ app.ws("/twilio", async (ws, req) => {
     const event = JSON.parse(msg.toString());
 
     if (event.event === "media") {
-      // forward audio from Twilio → OpenAI
-      oa.send(
-        JSON.stringify({
-          type: "input_audio_buffer.append",
-          audio: event.media.payload
-        })
-      );
+      const payload = JSON.stringify({
+        type: "input_audio_buffer.append",
+        audio: event.media.payload
+      });
+
+      if (oaReady) {
+        oa.send(payload);
+      } else {
+        pendingMessages.push(payload);
+      }
     }
 
     if (event.event === "start") {
-      console.log("📞 Call started");
+      console.log("▶️ Call started");
     }
 
     if (event.event === "stop") {
-      console.log("📞 Call ended");
-      oa.close();
+      console.log("⏹️ Call ended");
+      if (oa) oa.close();
     }
   });
 
   ws.on("close", () => {
     console.log("❌ Twilio closed");
-    oa.close();
+    if (oa) oa.close();
   });
 });
 
