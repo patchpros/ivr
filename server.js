@@ -125,11 +125,25 @@ app.ws("/twilio", async (twilioWS) => {
 
       if (data.event === "media") {
         // media.payload is base64 μ-law @ 8k; pass through to OpenAI
-        const payload = JSON.stringify({
-          type: "input_audio_buffer.append",
-          audio: data.media.payload
-        });
-        if (oaReady) oaWS.send(payload); else pending.push(payload);
+        // Queue the frame
+const payload = JSON.stringify({
+  type: "input_audio_buffer.append",
+  audio: data.media.payload
+});
+if (oaReady) oaWS.send(payload); else pending.push(payload);
+
+// Auto-commit every ~200ms so OpenAI knows a user turn is coming in
+if (oaReady) {
+  if (!twilioWS._lastCommit || Date.now() - twilioWS._lastCommit > 200) {
+    oaWS.send(JSON.stringify({ type: "input_audio_buffer.commit" }));
+    oaWS.send(JSON.stringify({
+      type: "response.create",
+      response: { modalities: ["audio", "text"], conversation: "auto" }
+    }));
+    twilioWS._lastCommit = Date.now();
+  }
+}
+
         return;
       }
 
@@ -162,3 +176,4 @@ app.ws("/twilio", async (twilioWS) => {
 
 // Start
 app.listen(PORT, () => console.log(`🚀 Server listening on ${PORT}`));
+
