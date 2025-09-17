@@ -1,92 +1,109 @@
 import express from "express";
-import expressWebSocket from "express-ws";
+import expressWs from "express-ws";
 import WebSocket from "ws";
-import fetch from "node-fetch";
+import OpenAI from "openai";
 
 const app = express();
-expressWebSocket(app, null, { perMessageDeflate: true });
+expressWs(app); // enable WebSocket on Express
 
-app.ws("/media-stream", async (ws, req) => {
-  console.log("🔗 Twilio stream connected");
+const PORT = process.env.PORT || 10000;
+const openai = new OpenAI({
+  apiKey: process.env.OPENAI_API_KEY
+});
 
-  // 1. Create OpenAI Realtime session
-  const resp = await fetch("https://api.openai.com/v1/realtime/sessions", {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify({
-      model: "gpt-4o-realtime-preview-2024-12-17",
-      voice: "marian",              // choose a voice
-      input_audio_format: "pcm16",  // Twilio sends PCM16
-      output_audio_format: "pcm16", // return PCM16 to Twilio
-    }),
+// health check
+app.get("/", (req, res) => {
+  res.send("✅ Twilio <-> OpenAI realtime server running");
+});
+
+// WebSocket endpoint Twilio will connect to
+app.ws("/twilio", async (ws, req) => {
+  console.log("Twilio connected");
+
+  // connect to OpenAI realtime API
+  const oa = new WebSocket(
+    "wss://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview-2024-12",
+    {
+      headers: {
+        Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
+        "OpenAI-Beta": "realtime=v1"
+      }
+    }
+  );
+
+  oa.on("open", () => {
+    console.log("✅ OpenAI connected");
+    // optional: configure session
+    oa.send(
+      JSON.stringify({
+        type: "session.update",
+        session: {
+          voice: "marin",
+          input_audio_format: "mulaw",
+          output_audio_format: "mulaw",
+          turn_detection: { type: "server_vad" }
+        }
+      })
+    );
   });
-  const session = await resp.json();
 
-  // 2. Connect to OpenAI Realtime WebSocket
-  const openai = new WebSocket(session.client_secret.value, {
-    headers: { Authorization: `Bearer ${process.env.OPENAI_API_KEY}` },
-  });
-
-  let streamSid = null;
-
-  ws.on("message", (msg) => {
+  oa.on("message", (msg) => {
     const data = JSON.parse(msg.toString());
 
-    // Grab stream SID from Twilio
-    if (data.event === "start") {
-      streamSid = data.start.streamSid;
-      console.log("✅ Twilio stream started:", streamSid);
-    }
-
-    // Forward microphone audio → OpenAI
-    if (data.event === "media" && openai.readyState === WebSocket.OPEN) {
-      openai.send(
-        JSON.stringify({
-          type: "input_audio_buffer.append",
-          audio: data.media.payload, // base64 PCM16 from Twilio
-        })
-      );
-    }
-
-    // Commit buffer after Twilio stops sending
-    if (data.event === "mark" && openai.readyState === WebSocket.OPEN) {
-      openai.send(JSON.stringify({ type: "input_audio_buffer.commit" }));
-      openai.send(JSON.stringify({ type: "response.create" }));
-    }
-  });
-
-  // 3. Handle OpenAI → Twilio
-  openai.on("message", (raw) => {
-    const evt = JSON.parse(raw.toString());
-
-    // Forward AI audio back to Twilio
-    if (evt.type === "response.output_audio.delta" && streamSid) {
+    if (data.type === "response.audio.delta") {
+      // stream audio chunks back to Twilio
       ws.send(
         JSON.stringify({
           event: "media",
-          streamSid,
-          media: { payload: evt.delta }, // already base64 PCM16
+          media: { payload: data.delta }
         })
       );
     }
 
-    // Log transcript
-    if (evt.type === "response.audio_transcript.delta") {
-      process.stdout.write(evt.delta);
+    if (data.type === "response.audio.done") {
+      ws.send(JSON.stringify({ event: "mark", mark: { name: "audio_done" } }));
     }
 
-    if (evt.type === "response.done") {
-      console.log("\n🤖 AI finished speaking\n");
+    if (data.type === "response.audio_transcript.delta") {
+      console.log("Transcript:", data.delta);
+    }
+  });
+
+  oa.on("close", () => {
+    console.log("❌ OpenAI closed");
+    ws.close();
+  });
+
+  ws.on("message", (msg) => {
+    const event = JSON.parse(msg.toString());
+
+    if (event.event === "media") {
+      // forward audio from Twilio → OpenAI
+      oa.send(
+        JSON.stringify({
+          type: "input_audio_buffer.append",
+          audio: event.media.payload
+        })
+      );
+    }
+
+    if (event.event === "start") {
+      console.log("📞 Call started");
+    }
+
+    if (event.event === "stop") {
+      console.log("📞 Call ended");
+      oa.close();
     }
   });
 
   ws.on("close", () => {
-    console.log("❌ Twilio WebSocket closed");
-    openai.close();
+    console.log("❌ Twilio closed");
+    oa.close();
   });
 });
 
-app.listen(3000, () => console.log("🚀 Listening on ws://localhost:3000/media-stream"));
+// start server
+app.listen(PORT, () => {
+  console.log(`🚀 Server listening on ${PORT}`);
+});
