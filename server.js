@@ -5,8 +5,8 @@ import fetch from "node-fetch";
 import alawmulaw from "alawmulaw";   // 👈 μ-law <-> PCM16
 
 // Decode/Encode functions
-const decode = alawmulaw.decode;     // Twilio μ-law → PCM16
-const encode = alawmulaw.encode;     // PCM16 → Twilio μ-law
+const { decode, encode } = alawmulaw;
+
 
 // ====== CONFIG ======
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
@@ -101,3 +101,4 @@ app.ws("/twilio", async (twilioWS, _req) => {
 app.listen(PORT, () => {
   console.log(`🚀 Server listening on ${PORT}`);
 });
+
