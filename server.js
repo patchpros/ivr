@@ -1,7 +1,8 @@
 import express from "express";
 import expressWs from "express-ws";
 import WebSocket from "ws";
-import ulaw from "mulaw-js";   // npm install mulaw-js
+import { RealtimeClient } from "@openai/realtime-client";
+import { decode, encode } from "alawmulaw";
 
 const app = express();
 expressWs(app);
@@ -117,3 +118,4 @@ app.ws("/twilio", (twilioWS) => {
 app.listen(PORT, () => {
   console.log(`🚀 Server listening on ${PORT}`);
 });
+
